@@ -1,0 +1,912 @@
+---
+title: "Regeneration time-series analysis"
+output: html_document
+date: "2025-10-23"
+---
+
+# Read in data
+```{r}
+library(DESeq2); library(ggplot2); library(dplyr); library(tidyr);
+
+count_matrix <- read.csv("/storage/RNASeq2025/06_salmon/reg2.gene.counts.matrix", header = TRUE, row.names = 1, sep = "\t")
+count_matrix <- count_matrix[,order(names(count_matrix))]
+
+metadata <- data.frame(
+    condition = factor(c("T0AS","T0AS","T0AS","T0AS","T0S","T0S","T0S",
+                         "T1AS","T1AS","T1AS","T1AS","T1S","T1S","T1S",
+                         rep("T2AS",4),rep("T2S",4),
+                         rep("T3AS",4),rep("T3S",4))),
+    row.names = colnames(count_matrix))
+metadata$repr.mode <- as.factor(ifelse(grepl("AS",metadata$condition),"AS","S"))
+metadata$time <- as.factor(substring(row.names(metadata), 1,2))
+metadata$batch <- as.factor(ifelse(grepl("4",rownames(metadata)), "B", "A"))
+```
+
+# Perform PCA
+```{r, eval=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = round(count_matrix), colData = metadata,
+                              design = ~ batch + time + repr.mode)
+dds <- dds[rowSums(counts(dds)>=10) >=5,]
+
+dds_lrt <- DESeq(dds, test = "LRT", reduced = ~ batch + repr.mode)
+res_lrt <- results(dds_lrt)
+
+sig_genes <- rownames(res_lrt)[which(res_lrt$padj < 0.05)]
+
+rld <- rlog(dds, blind = FALSE)
+rld_sig <- rld[sig_genes, ]
+
+#plotPCA(rld_sig, intgroup = c("time", "repr.mode"))
+pcaData <- plotPCA(rld_sig, intgroup = "repr.mode", returnData = TRUE, ntop=1000,
+                   pcsToUse=1:2)
+
+pcaData$repr.mode <- ifelse(grepl("AS",pcaData$name), "Asexual", "Sexual")
+pcaData$time <- substr(pcaData$name, 1,2)
+pcaData$batch <- ifelse(grepl("4",pcaData$name),"B","A")
+
+centroids <- pcaData %>%
+  group_by(repr.mode, time) %>%
+  summarise(centroid_PC1 = mean(PC1), centroid_PC2 = mean(PC2))
+
+cols <- RColorBrewer::brewer.pal(4, "Set1"); names(cols) <- c("T0","T1","T2","T3")
+
+ggplot(pcaData, aes(x = PC1, y = PC2, shape = repr.mode)) +
+    geom_point(aes(fill=time),size = 4, stroke=1, alpha=0.75) +
+    scale_fill_manual(values = c("T0"="#E41A1C", "T1"="#377EB8","T2"="#4DAF4A","T3"="#984EA3")) +
+    scale_shape_manual(values=c(21,24))+
+    geom_path(data = centroids, aes(x = centroid_PC1, y = centroid_PC2, group = repr.mode, color = "grey20"), arrow = arrow(type = "closed", length = unit(0.2, "inches")),size=1)+
+    guides(fill=guide_legend(override.aes=list(colour=c("T0"="#E41A1C", "T1"="#377EB8","T2"="#4DAF4A","T3"="#984EA3"))))+
+    scale_color_manual(values = c("T0"="#E41A1C", "T1"="#377EB8","T2"="#4DAF4A","T3"="#984EA3")) +
+    labs(title = "PCA of Gene Expression", x = "PC1", y = "PC2") +
+    theme_bw(base_size=14) + 
+  theme(legend.title = element_blank())
+ggsave(file="/storage/RNASeq2025/08_deseq2/gene_PCA_plot_small.png",width=8,height=6,bg="white")
+
+ggplot(pcaData, aes(x = PC1, y = PC2, shape = repr.mode)) +
+    geom_point(aes(fill=time),size = 4, stroke=1, alpha=0.75) +
+    facet_wrap(~batch)+
+    scale_fill_manual(values = c("T0"="#E41A1C", "T1"="#377EB8","T2"="#4DAF4A","T3"="#984EA3")) +
+    scale_shape_manual(values=c(21,24))+
+    geom_path(data = centroids, aes(x = centroid_PC1, y = centroid_PC2, group = repr.mode, color = "grey20"), arrow = arrow(type = "closed", length = unit(0.2, "inches")),size=1)+
+    guides(fill=guide_legend(override.aes=list(colour=c("T0"="#E41A1C", "T1"="#377EB8","T2"="#4DAF4A","T3"="#984EA3"))))+
+    scale_color_manual(values = c("T0"="#E41A1C", "T1"="#377EB8","T2"="#4DAF4A","T3"="#984EA3")) +
+    labs(title = "PCA of Gene Expression", x = "PC1", y = "PC2") +
+    theme_bw(base_size=14) + 
+  theme(legend.title = element_blank())
+ggsave(file="/storage/RNASeq2025/08_deseq2/gene_PCA_plot_batch.png",width=10,height=6,bg="white")
+```
+
+# Read in annotations
+```{r}
+trin <- read.csv("/storage/RNASeq2025/07_trinotate/reg2_cdhit/Trinotate_reg2_cdhit.xls",sep="\t")
+trin$Hydra_vulgaris_BLASTP <- sapply(strsplit(trin$Hydra_vulgaris_BLASTP,"^",fixed=T),"[",1)
+id_to_desc <- read.delim("/storage/RNASeq2025/07_trinotate/reg2_cdhit/id_to_desc.tsv", header = FALSE, sep = "\t", quote = "")
+colnames(id_to_desc) <- c("UniProtID", "Hvul_Description")
+trin <- trin %>%  left_join(id_to_desc, by = c("Hydra_vulgaris_BLASTP" = "UniProtID"))
+trin$GENE <- sapply(strsplit(trin$sprot_Top_BLASTP,split="^",fixed=T),"[",1)
+
+gene2go <- trin %>%
+  dplyr::select(gene_id = X.gene_id, GO_raw = gene_ontology_BLASTP) %>%
+  filter(!is.na(GO_raw) & GO_raw != "") %>%
+  mutate(GO_list = strsplit(as.character(GO_raw), "`")) %>%
+  unnest(GO_list) %>%
+  mutate(GO = sub("\\^.*", "", GO_list)) %>%
+    dplyr::select(gene_id, GO) %>%
+    filter(GO!=".")
+```
+
+
+#WGCNA
+```{r}
+library(reshape2); library(WGCNA)
+
+dds <- DESeqDataSetFromMatrix(countData = round(count_matrix), colData = metadata,
+                              design = ~ batch)
+dds <- dds[rowSums(counts(dds)>=10) >=5,]
+
+rld <- vst(dds, blind = FALSE)
+expr <- t(assay(rld))
+geneVar <- apply(expr, 2, var)
+topGenes <- order(geneVar, decreasing = TRUE)
+expr <- expr[, topGenes]
+
+gsg <- goodSamplesGenes(expr, verbose = 3)
+gsg$allOK
+sampleTree <- hclust(dist(expr), method = "average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="")
+## T1_AS1 looks an outlier, we remove it?
+expr2 <- expr[row.names(expr)!="T1_AS1",]
+
+# Do this once to find softPower
+#powers <- c(1:20)
+#sft <- pickSoftThreshold(expr2, powerVector = powers, verbose = 5)
+#plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+#     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit", type="n")
+#text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, cex=0.9, col="red")
+#abline(h=0.9, col="red")
+
+net <- blockwiseModules(
+  expr2,
+  power = 2, # we found this value in the commented chunk above
+  TOMType = "signed",          # or "unsigned"
+  corType = "pearson",
+  minModuleSize = 50,
+  deepSplit = 2,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.15,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,             # saves partial TOMs per block
+  saveTOMFileBase = "myTOM",
+  maxBlockSize = 5000,      
+  verbose = 3,
+  nThreads=8
+)
+
+traitData <- metadata[,c("repr.mode","time")][row.names(metadata)!="T1_AS1",] # we remove T1_AS1 because it's an outlier
+traitData$repr.mode <- ifelse(traitData$repr.mode=="AS","Asexual","Sexual")
+traitData$repr.mode <- factor(traitData$repr.mode, levels=c("Asexual","Sexual"))
+traitData$time <- factor(traitData$time, levels=c("T0", "T1", "T2", "T3"))
+
+MEs <- moduleEigengenes(expr2, colors = net$colors)$eigengenes
+MEs <- orderMEs(MEs)
+datME <- cbind(traitData, MEs)
+
+library(limma)
+design <- model.matrix(~ repr.mode * time, data = traitData)
+colnames(design) <- make.names(colnames(design))
+colnames(design)
+fit <- lmFit(t(MEs), design)
+fit <- eBayes(fit)
+
+contrast.matrix <- makeContrasts(
+  Asexual_T3_vs_T0 = timeT3,               # (1) within asexuals
+  Interaction_T3 = repr.modeSexual.timeT3, # (2) difference in change between groups
+  levels = design
+)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+topTable(fit2, coef = "Asexual_T3_vs_T0")       # modules changing over time in AS
+sel.modules <- gsub("ME","Module ",topTable(fit2, coef = "Asexual_T3_vs_T0")%>%filter(adj.P.Val<0.05)%>%row.names())
+
+MEs <- moduleEigengenes(expr2, colors = net$colors)$eigengenes
+MEs <- orderMEs(MEs)
+traitData.num <- data.frame(model.matrix(~ repr.mode * time, data = traitData)[, -1])
+moduleTraitCor <- cor(MEs, traitData.num, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples = nrow(traitData))
+library(ComplexHeatmap)
+moduleTraitrel <- Heatmap(moduleTraitCor,cluster_columns = F, name="Coefficient:",column_title="Module-trait relationships",
+                                     column_names_side="bottom",
+              heatmap_legend_param=list(direction="horizontal"),
+                          column_names_rot = 60,
+                          column_title_gp=gpar(fontsize=16),
+              row_names_gp = gpar(fontsize=8))
+
+df <- cbind(traitData, MEs)
+df_long <- melt(df, id.vars = c("repr.mode", "time"),
+                variable.name = "Module", value.name = "Eigengene")
+df_long$Module <- gsub("^ME", "", df_long$Module)
+df_summary <- df_long %>%
+  group_by(Module, repr.mode, time) %>%
+  summarise(mean = mean(Eigengene, na.rm = TRUE),
+            se = sd(Eigengene, na.rm = TRUE) / sqrt(n()), .groups = "drop")
+colors <- c("Asexual" = "#56B4E9", "Sexual" = "#E69F00")
+df_summary$Module <- paste("Module", df_summary$Module)
+df_summary$Module <- factor(
+  df_summary$Module,
+  levels = unique(df_summary$Module[order(as.numeric(sub("Module ", "", df_summary$Module)))])
+)
+
+modplot <- ggplot(df_summary%>%filter(Module%in%sel.modules), 
+                  aes(x = time, y = mean, 
+                                     color = repr.mode, group = repr.mode)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.15, size = 0.4) +
+  facet_wrap(~ Module, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = colors, name = "Reproductive mode") +
+  theme_bw(base_size = 12) +
+  guides(color = guide_legend(
+    title.position = "top",
+    direction = "vertical"
+  )) +
+  theme(
+    strip.background = element_rect(fill = "grey90", color = "grey70"),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  ) +
+  labs(x = "Time point", y = "Mean module eigengene ± SE",
+       title = "Module eigengenes")
+```
+
+# GO enrichment analysis on selected modules
+```{r}
+trin_gene <- trin %>% arrange(X.gene_id, ifelse(gene_ontology_BLASTP == ".", 1, 0)) %>%
+  group_by(X.gene_id) %>% slice_head(n = 1) %>% ungroup()
+
+gene_mod <- net$colors %>% data.frame() %>% tibble::rownames_to_column(var="geneID")
+
+mod_table <- merge(trin_gene[c("X.gene_id", "sprot_Top_BLASTP_hit", "Hvul_Description")],
+                   gene_mod, by.x="X.gene_id", by.y="geneID")
+write.table(mod_table, file="/storage/RNASeq2025/08_deseq2/reg_modules.csv",
+            row.names=F, col.names = T, sep="\t", quote=F)
+
+library(topGO)
+geneID2GO <- setNames(strsplit(trin$gene_ontology_BLASTP, split = "`"), trin$X.gene_id)
+geneID2GO <- lapply(geneID2GO, function(x) {  sapply(strsplit(x, split = "\\^"), `[`, 1)})
+allGenes <- trin$X.gene_id
+
+all.modules <- NULL
+
+for(i in 1:length(sel.modules)){
+  module.genes <- names(which(net$colors==gsub("Module ","",sel.modules[i])))
+  geneList <- factor(as.integer(allGenes %in% module.genes)); names(geneList) <- allGenes
+  GOdata <- new("topGOdata",
+              ontology = "BP", 
+              allGenes = geneList,
+              annot = annFUN.gene2GO,
+              gene2GO = geneID2GO,
+              nodeSize = 10)
+  resultFisher <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+  allRes <- GenTable(GOdata,
+                   Fisher = resultFisher,
+                   orderBy = "Fisher",
+                   ranksOf = "Fisher",
+                   topNodes = 10)
+  allRes$Fisher <- as.numeric(sub("< ", "", allRes$Fisher))
+  sigRes <- subset(allRes, Fisher < 0.05)
+  sigRes$logP <- -log10(sigRes$Fisher)
+  sigRes$Term <- forcats::fct_reorder(sigRes$Term, sigRes$logP)
+  sigRes$Module <- sel.modules[i]
+  all.modules <- rbind(all.modules, sigRes)
+}
+
+all.modules$Module <- factor(
+  all.modules$Module,
+  levels = unique(all.modules$Module[order(as.numeric(sub("Module ", "", all.modules$Module)))])
+)
+
+mod.enrichplot <- ggplot(all.modules, 
+                         aes(x = tidytext::reorder_within(Term, logP, Module), 
+                             y = logP)) +
+  facet_wrap(~Module, scales="free_y",ncol=2)+
+    geom_col(fill = "#4C72B0") +
+    coord_flip() +
+    tidytext::scale_x_reordered(
+      labels = function(x) {
+        cleaned_x <- gsub("___.*$", "", x)
+        label_wrap_gen(width = 25)(cleaned_x)
+      }
+    ) +
+    theme_bw() +
+    labs(
+    title = "Module GO enrichment",
+    x = NULL,
+    y = expression(-log[10]("Fisher p-value"))
+  ) +
+  theme(
+        strip.text = element_text(face = "bold"),
+    plot.title = element_text(margin = margin(b=10))
+  )
+
+```
+
+```{r}
+ragg::agg_tiff(file="/storage/RNASeq2025/08_deseq2/modules.tiff",width=12,height=12,
+               units="in",res=300, scaling=0.85)
+ggpubr::ggarrange(
+  grid.grabExpr(
+    draw(moduleTraitrel,
+      heatmap_legend_side="top",      ,
+      padding = unit(c(1, 1, 0, 1), "cm")
+      )
+    ), labels=c("A",""),
+  ggpubr::ggarrange(modplot+theme(plot.margin = margin(b=1.5,unit="cm")), 
+  mod.enrichplot+theme(plot.margin = margin(b=4.25,l=1,r=0.5,unit="cm"),
+                       panel.spacing.x = unit(1.5, "lines")),widths=c(0.4,1), ncol=2,labels=c("B","C")
+  ),
+  ncol=2,widths=c(0.5,1))
+dev.off()
+```
+
+
+# Wnt genes
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = round(count_matrix), colData = metadata,
+                              design = ~ batch + time + repr.mode + time:repr.mode)
+dds <- dds[rowSums(counts(dds)>=10) >=5,]
+
+dds_03 <- dds[, colData(dds)$condition %in% c("T0AS", "T0S", "T3AS", "T3S")]
+colData(dds_03)$time <- factor(substr(as.character(colData(dds_03)$condition), 1, 2))
+colData(dds_03)$repr.mode <- factor(gsub("[T0|T3]", "", as.character(colData(dds_03)$condition)))
+dds_03 <- DESeq(dds_03)
+
+interaction_results <- results(dds_03, name = "timeT3.repr.modeS")
+top_interaction_genes <- interaction_results[order(interaction_results$padj), ]
+
+############################################################################################
+
+#wnt.trin <- trin[grep("canonical Wnt", trin$gene_ontology_BLASTP),]
+wnt.trin <- trin[grep("GO:0060070|GO:0060828|GO:0090090|GO:0090263", trin$gene_ontology_BLASTP),]
+
+dds <- DESeqDataSetFromMatrix(countData = round(count_matrix[row.names(count_matrix)%in%wnt.trin$X.gene_id,]), colData = metadata,
+                              design = ~ batch + time + repr.mode + time:repr.mode)
+dds <- dds[rowSums(counts(dds)>=10) >=5,]
+
+dds_03 <- dds[, colData(dds)$condition %in% c("T0AS", "T0S", "T3AS", "T3S")]
+colData(dds_03)$time <- factor(substr(as.character(colData(dds_03)$condition), 1, 2))
+colData(dds_03)$repr.mode <- factor(gsub("[T0|T3]", "", as.character(colData(dds_03)$condition)))
+dds_03 <- DESeq(dds_03)
+
+interaction_results <- results(dds_03, name = "timeT3.repr.modeS")
+top_interaction_genes <- interaction_results[order(interaction_results$padj), ]
+
+resWnt <- top_interaction_genes[row.names(top_interaction_genes)%in%wnt.trin$X.gene_id,] %>% data.frame() %>% filter(padj < 0.05)
+resWnt$GENE <- wnt.trin$GENE[match(row.names(resWnt), wnt.trin$X.gene_id)]
+wnt.trin$Hvul_Description[match(row.names(resWnt), wnt.trin$X.gene_id)]
+
+resWnt$HyName <- c("wnt7","wnt16","wnt11","lrrk2","wls","egf","wnt3")
+
+sel.transcripts <- merge(resWnt, count_matrix[row.names(count_matrix)%in%row.names(resWnt),], by="row.names")
+
+df <- pivot_longer(sel.transcripts, cols=grep("^T[0-9]", names(sel.transcripts)))
+
+aggregated_data <- df %>%
+    group_by(HyName, name) %>%
+          summarize(value = sum(value), .groups = "drop")
+
+df$Time <- gsub("([T][0-3]).*", "\\1", df$name)
+df$S_AS <- ifelse(grepl("AS",df$name),"Asexual","Sexual")
+summary_data <- aggregate(value ~ HyName + Time + S_AS, data = df,
+                          FUN = function(x) c(mean = mean(x), sd = sd(x), se = sd(x) / sqrt(length(x))))
+summary_data <- do.call(data.frame, summary_data)
+colnames(summary_data)[4:6] <- c("mean", "sd", "se")
+
+summary_data$HyName <- factor(summary_data$HyName, levels=c("egf","lrrk2","wls","wnt3","wnt7","wnt11","wnt16"))
+
+ragg::agg_png(file="/storage/RNASeq2025/08_deseq2/gene_expression_toprightLegend.png",res=300, width=2400, height=800, scaling=0.9)
+ggplot(summary_data, aes(x = Time, y = mean, color = S_AS, group = S_AS)) +
+  geom_line(linewidth=1.2) +
+  geom_point() +
+    geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.1)+
+    facet_wrap(~ HyName, scales="free_y", nrow=1) +
+    scale_color_manual(values=c("Asexual"="#B1C282", "Sexual"="#bf1029"))+
+  labs(title = "Gene Expression Over Time",
+       x = "Time",
+       y = "Mean Expression",
+       color = "") +
+    theme_bw(base_size=12)+
+    theme(strip.text = element_text(face = "italic",family="Dejavu Sans"),
+          legend.direction = "horizontal",
+          legend.position="inside",
+          legend.position.inside=c(0.875,1.25),
+          legend.margin = margin(t = -10, r = 0, b = -10, l = 0, unit = "pt"),
+          axis.text = element_text(size=8))
+dev.off()
+```
+
+# Gene Ontology enrichment analysis time series
+```{r}
+library(topGO); library(rrvgo); library(GOSemSim); library(GO.db); library(stringr); library(forcats); library(cowplot)
+
+dds <- DESeqDataSetFromMatrix(countData = round(count_matrix),
+                              colData = metadata,
+                              design = ~ repr.mode + time + repr.mode:time)
+dds <- DESeq(dds)
+
+source("/storage/RNASeq2025/08_deseq2/run_GO_similarity.R")
+combined_reduced_T1 <- run_GO_similarity_analysis(dds=dds, timepoint="1",gene2go=gene2go)
+combined_reduced_T2 <- run_GO_similarity_analysis(dds=dds, timepoint="2",gene2go=gene2go)
+combined_reduced_T3 <- run_GO_similarity_analysis(dds=dds, timepoint="3",gene2go=gene2go)
+
+diffExpr.t1.AS <- combined_reduced_T1[[2]] %>% data.frame() %>% filter(padj<0.05 & abs(log2FoldChange)>0) %>% arrange(log2FoldChange)
+diffExpr.t1.AS$Gene <- sapply(strsplit(trin$sprot_Top_BLASTP_hit[match(row.names(diffExpr.t1.AS), trin$X.gene_id)], split=";", fixed=T),"[",1)
+diffExpr.t1.S <- combined_reduced_T1[[3]] %>% data.frame() %>% filter(padj<0.05 & abs(log2FoldChange)>0) %>% arrange(log2FoldChange)
+diffExpr.t1.S$Gene <- sapply(strsplit(trin$sprot_Top_BLASTP_hit[match(row.names(diffExpr.t1.S), trin$X.gene_id)], split=";", fixed=T),"[",1)
+diffExpr.t2.AS <- combined_reduced_T2[[2]] %>% data.frame() %>% filter(padj<0.05 & abs(log2FoldChange)>0) %>% arrange(log2FoldChange)
+diffExpr.t2.AS$Gene <- sapply(strsplit(trin$sprot_Top_BLASTP_hit[match(row.names(diffExpr.t2.AS), trin$X.gene_id)], split=";", fixed=T),"[",1)
+diffExpr.t2.S <- combined_reduced_T2[[3]] %>% data.frame() %>% filter(padj<0.05 & abs(log2FoldChange)>0) %>% arrange(log2FoldChange)
+diffExpr.t2.S$Gene <- sapply(strsplit(trin$sprot_Top_BLASTP_hit[match(row.names(diffExpr.t2.S), trin$X.gene_id)], split=";", fixed=T),"[",1)
+diffExpr.t3.AS <- combined_reduced_T3[[2]] %>% data.frame() %>% filter(padj<0.05 & abs(log2FoldChange)>0) %>% arrange(log2FoldChange)
+diffExpr.t3.AS$Gene <- sapply(strsplit(trin$sprot_Top_BLASTP_hit[match(row.names(diffExpr.t3.AS), trin$X.gene_id)], split=";", fixed=T),"[",1)
+diffExpr.t3.S <- combined_reduced_T3[[3]] %>% data.frame() %>% filter(padj<0.05 & abs(log2FoldChange)>0) %>% arrange(log2FoldChange)
+diffExpr.t3.S$Gene <- sapply(strsplit(trin$sprot_Top_BLASTP_hit[match(row.names(diffExpr.t3.S), trin$X.gene_id)], split=";", fixed=T),"[",1)
+
+write.table(diffExpr.t1.AS, file="/storage/RNASeq2025/08_deseq2/diffExpr_T1_AS.csv",col.names=T, row.names=T, quote=F, sep="\t")
+write.table(diffExpr.t1.S, file="/storage/RNASeq2025/08_deseq2/diffExpr_T1_S.csv",col.names=T, row.names=T, quote=F, sep="\t")
+write.table(diffExpr.t2.AS, file="/storage/RNASeq2025/08_deseq2/diffExpr_T2_AS.csv",col.names=T, row.names=T, quote=F, sep="\t")
+write.table(diffExpr.t2.S, file="/storage/RNASeq2025/08_deseq2/diffExpr_T2_S.csv",col.names=T, row.names=T, quote=F, sep="\t")
+write.table(diffExpr.t3.AS, file="/storage/RNASeq2025/08_deseq2/diffExpr_T3_AS.csv",col.names=T, row.names=T, quote=F, sep="\t")
+write.table(diffExpr.t3.S, file="/storage/RNASeq2025/08_deseq2/diffExpr_T3_S.csv",col.names=T, row.names=T, quote=F, sep="\t")
+
+######################################################################################################
+res.T1.AS <- combined_reduced_T1[[2]]%>%data.frame()%>%tibble::rownames_to_column()%>%
+    filter(padj<0.05 & abs(log2FoldChange))%>%
+    mutate(regulation = ifelse(log2FoldChange>0, "up-regulated", "down-regulated"))%>%
+    mutate(annotated = ifelse(rowname%in%gene2go$gene_id,"yes","no"))
+gc.AS <- as.data.frame(table(res.T1.AS$regulation, res.T1.AS$annotated)) %>%
+    as_tibble() %>%
+    rename(regulation = Var1, annotated = Var2, count = Freq)%>%
+    mutate(repr.mode="Asexual")
+res.T1.S <- combined_reduced_T1[[3]]%>%data.frame()%>%tibble::rownames_to_column()%>%
+    filter(padj<0.05 & abs(log2FoldChange))%>%
+    mutate(regulation = ifelse(log2FoldChange>0, "up-regulated", "down-regulated"))%>%
+    mutate(annotated = ifelse(rowname%in%gene2go$gene_id,"yes","no"))
+gc.S <- as.data.frame(table(res.T1.S$regulation, res.T1.S$annotated)) %>%
+    as_tibble() %>%
+    rename(regulation = Var1, annotated = Var2, count = Freq)%>%
+    mutate(repr.mode="Sexual")
+gene.counts <- bind_rows(gc.AS, gc.S)
+
+tot.genes <- tapply(gene.counts$count, list(gene.counts$repr.mode, gene.counts$regulation), sum)
+sizes <- 0.75 * sqrt((tot.genes+100) / (2937+100))
+x.positions <- 0.8 - sizes/2; y.positions <- 0.35 - sizes/2
+
+p1 <- ggplot(combined_reduced_T1[[1]] %>%
+               filter(repr.mode == "Asexual" & type == "up-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Asexual / up-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Asexual" & regulation == "up-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Asexual","up-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p1 <- ggdraw(p1) + draw_plot(pie_plot, x = x.positions["Asexual","up-regulated"],
+                             y = y.positions["Asexual","up-regulated"],
+                             width=sizes["Asexual","up-regulated"],
+                             height=sizes["Asexual","up-regulated"])
+
+p2 <- ggplot(combined_reduced_T1[[1]] %>%
+               filter(repr.mode == "Asexual" & type == "down-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+    geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Asexual / down-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) + 
+  theme(strip.text = element_text(face = "bold"), axis.title.y=element_text(margin=margin(r=235)))
+pie_data <- gene.counts %>% filter(repr.mode == "Asexual" & regulation == "down-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Asexual","down-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p2 <- ggdraw(p2) + draw_plot(pie_plot, x = x.positions["Asexual","down-regulated"],
+                             y = y.positions["Asexual","down-regulated"],
+                             width=sizes["Asexual","down-regulated"],
+                             height=sizes["Asexual","down-regulated"])
+
+p3 <- ggplot(combined_reduced_T1[[1]] %>%
+               filter(repr.mode == "Sexual" & type == "up-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+    geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Sexual / up-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Sexual" & regulation == "up-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Sexual","up-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p3 <- ggdraw(p3) + draw_plot(pie_plot, x = x.positions["Sexual","up-regulated"],
+                             y = y.positions["Sexual","up-regulated"],
+                             width=sizes["Sexual","up-regulated"],
+                             height=sizes["Sexual","up-regulated"])
+
+p4 <- ggplot(combined_reduced_T1[[1]] %>%
+               filter(repr.mode == "Sexual" & type == "down-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Sexual / down-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+    theme_minimal(base_size = 14) +
+    theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Sexual" & regulation == "down-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Sexual","down-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p4 <- ggdraw(p4) + draw_plot(pie_plot, x = x.positions["Sexual","down-regulated"],
+                             y = y.positions["Sexual","down-regulated"],
+                             width=sizes["Sexual","down-regulated"],
+                             height=sizes["Sexual","down-regulated"])
+ragg::agg_png("/storage/RNASeq2025/08_deseq2/go_t1.png", height=2000, width=3000,res=300, scaling=0.5)
+((p1 / p2) | (p3 / p4))+plot_annotation(title="Enriched Gene Ontology terms at T1 vs. T0",
+                                        theme=theme(plot.title = element_text(size = 16, face = "bold")))
+dev.off()
+
+######################################################################################################
+res.T2.AS <- combined_reduced_T2[[2]]%>%data.frame()%>%tibble::rownames_to_column()%>%
+    filter(padj<0.05 & abs(log2FoldChange))%>%
+    mutate(regulation = ifelse(log2FoldChange>0, "up-regulated", "down-regulated"))%>%
+    mutate(annotated = ifelse(rowname%in%gene2go$gene_id,"yes","no"))
+gc.AS <- as.data.frame(table(res.T2.AS$regulation, res.T2.AS$annotated)) %>%
+    as_tibble() %>%
+    rename(regulation = Var1, annotated = Var2, count = Freq)%>%
+    mutate(repr.mode="Asexual")
+res.T2.S <- combined_reduced_T2[[3]]%>%data.frame()%>%tibble::rownames_to_column()%>%
+    filter(padj<0.05 & abs(log2FoldChange))%>%
+    mutate(regulation = ifelse(log2FoldChange>0, "up-regulated", "down-regulated"))%>%
+    mutate(annotated = ifelse(rowname%in%gene2go$gene_id,"yes","no"))
+gc.S <- as.data.frame(table(res.T2.S$regulation, res.T2.S$annotated)) %>%
+    as_tibble() %>%
+    rename(regulation = Var1, annotated = Var2, count = Freq)%>%
+    mutate(repr.mode="Sexual")
+gene.counts <- bind_rows(gc.AS, gc.S)
+
+tot.genes <- tapply(gene.counts$count, list(gene.counts$repr.mode, gene.counts$regulation), sum)
+sizes <- 0.75 * sqrt((tot.genes+100) / (2937+100))
+x.positions <- 0.8 - sizes/2; y.positions <- 0.35 - sizes/2
+
+p1 <- ggplot(combined_reduced_T2[[1]] %>%
+               filter(repr.mode == "Asexual" & type == "up-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Asexual / up-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Asexual" & regulation == "up-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Asexual","up-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p1 <- ggdraw(p1) + draw_plot(pie_plot, x = x.positions["Asexual","up-regulated"],
+                             y = y.positions["Asexual","up-regulated"],
+                             width=sizes["Asexual","up-regulated"],
+                             height=sizes["Asexual","up-regulated"])
+
+p2 <- ggplot(combined_reduced_T2[[1]] %>%
+               filter(repr.mode == "Asexual" & type == "down-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+    geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Asexual / down-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) + 
+  theme(strip.text = element_text(face = "bold"), axis.title.y=element_text(margin=margin(r=235)))
+pie_data <- gene.counts %>% filter(repr.mode == "Asexual" & regulation == "down-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Asexual","down-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p2 <- ggdraw(p2) + draw_plot(pie_plot, x = x.positions["Asexual","down-regulated"],
+                             y = y.positions["Asexual","down-regulated"],
+                             width=sizes["Asexual","down-regulated"],
+                             height=sizes["Asexual","down-regulated"])
+
+p3 <- ggplot(combined_reduced_T2[[1]] %>%
+               filter(repr.mode == "Sexual" & type == "up-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+    geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Sexual / up-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=235)))
+pie_data <- gene.counts %>% filter(repr.mode == "Sexual" & regulation == "up-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Sexual","up-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p3 <- ggdraw(p3) + draw_plot(pie_plot, x = x.positions["Sexual","up-regulated"],
+                             y = y.positions["Sexual","up-regulated"],
+                             width=sizes["Sexual","up-regulated"],
+                             height=sizes["Sexual","up-regulated"])
+
+p4 <- ggplot(combined_reduced_T2[[1]] %>%
+               filter(repr.mode == "Sexual" & type == "down-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Sexual / down-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+    theme_minimal(base_size = 14) +
+    theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=235)))
+pie_data <- gene.counts %>% filter(repr.mode == "Sexual" & regulation == "down-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Sexual","down-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p4 <- ggdraw(p4) + draw_plot(pie_plot, x = x.positions["Sexual","down-regulated"],
+                             y = y.positions["Sexual","down-regulated"],
+                             width=sizes["Sexual","down-regulated"],
+                             height=sizes["Sexual","down-regulated"])
+ragg::agg_png("/storage/RNASeq2025/08_deseq2/go_t2.png", height=2000, width=3000,res=300, scaling=0.5)
+((p1 / p2) | (p3 / p4))+plot_annotation(title="Enriched Gene Ontology terms at T2 vs. T0",
+                                        theme=theme(plot.title = element_text(size = 16, face = "bold")))
+dev.off()
+
+######################################################################################################
+res.T3.AS <- combined_reduced_T3[[2]]%>%data.frame()%>%tibble::rownames_to_column()%>%
+    filter(padj<0.05 & abs(log2FoldChange))%>%
+    mutate(regulation = ifelse(log2FoldChange>0, "up-regulated", "down-regulated"))%>%
+    mutate(annotated = ifelse(rowname%in%gene2go$gene_id,"yes","no"))
+gc.AS <- as.data.frame(table(res.T3.AS$regulation, res.T3.AS$annotated)) %>%
+    as_tibble() %>%
+    rename(regulation = Var1, annotated = Var2, count = Freq)%>%
+    mutate(repr.mode="Asexual")
+res.T3.S <- combined_reduced_T3[[3]]%>%data.frame()%>%tibble::rownames_to_column()%>%
+    filter(padj<0.05 & abs(log2FoldChange))%>%
+    mutate(regulation = ifelse(log2FoldChange>0, "up-regulated", "down-regulated"))%>%
+    mutate(annotated = ifelse(rowname%in%gene2go$gene_id,"yes","no"))
+gc.S <- as.data.frame(table(res.T3.S$regulation, res.T3.S$annotated)) %>%
+    as_tibble() %>%
+    rename(regulation = Var1, annotated = Var2, count = Freq)%>%
+    mutate(repr.mode="Sexual")
+gene.counts <- bind_rows(gc.AS, gc.S)
+
+tot.genes <- tapply(gene.counts$count, list(gene.counts$repr.mode, gene.counts$regulation), sum)
+sizes <- 0.75 * sqrt((tot.genes+100) / (2937+100))
+x.positions <- 0.8 - sizes/2; y.positions <- 0.35 - sizes/2
+
+p1 <- ggplot(combined_reduced_T3[[1]] %>%
+               filter(repr.mode == "Asexual" & type == "up-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Asexual / up-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Asexual" & regulation == "up-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Asexual","up-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p1 <- ggdraw(p1) + draw_plot(pie_plot, x = x.positions["Asexual","up-regulated"],
+                             y = y.positions["Asexual","up-regulated"],
+                             width=sizes["Asexual","up-regulated"],
+                             height=sizes["Asexual","up-regulated"])
+
+p2 <- ggplot(combined_reduced_T3[[1]] %>%
+               filter(repr.mode == "Asexual" & type == "down-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+    geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Asexual / down-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) + 
+  theme(strip.text = element_text(face = "bold"), axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Asexual" & regulation == "down-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Asexual","down-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p2 <- ggdraw(p2) + draw_plot(pie_plot, x = x.positions["Asexual","down-regulated"],
+                             y = y.positions["Asexual","down-regulated"],
+                             width=sizes["Asexual","down-regulated"],
+                             height=sizes["Asexual","down-regulated"])
+
+p3 <- ggplot(combined_reduced_T3[[1]] %>%
+               filter(repr.mode == "Sexual" & type == "up-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+    geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Sexual / up-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Sexual" & regulation == "up-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Sexual","up-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p3 <- ggdraw(p3) + draw_plot(pie_plot, x = x.positions["Sexual","up-regulated"],
+                             y = y.positions["Sexual","up-regulated"],
+                             width=sizes["Sexual","up-regulated"],
+                             height=sizes["Sexual","up-regulated"])
+
+p4 <- ggplot(combined_reduced_T3[[1]] %>%
+               filter(repr.mode == "Sexual" & type == "down-regulated") %>%
+               filter(score > -log10(0.01)) %>%
+               mutate(
+                 term = fct_reorder(term, score),
+                 term_wrapped = str_wrap(as.character(term), width = 40),
+                 term_wrapped = factor(term_wrapped, levels = term_wrapped[order(term)])
+               ),
+             aes(x = term_wrapped, y = score, fill = category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + ylim(0, 18) +
+    labs(
+        title="Sexual / down-regulated",
+    x = "Representative GO Term",
+    y = expression(-log[10](p-value))
+  ) +
+    theme_minimal(base_size = 14) +
+    theme(strip.text = element_text(face = "bold"),axis.title.y=element_text(margin=margin(r=40)))
+pie_data <- gene.counts %>% filter(repr.mode == "Sexual" & regulation == "down-regulated")
+pie_plot <- ggplot(pie_data, aes(x = "", y = count, fill = annotated)) +
+    geom_col(width = 1, color = "white") +
+    labs(title="Prop. annotated genes",
+         subtitle=paste("N =", tot.genes["Sexual","down-regulated"]))+
+  coord_polar("y") +
+  scale_fill_manual(values = c("no" = "grey70", "yes" = "steelblue")) +
+  theme_void() +
+    theme(legend.position = "none",
+          plot.title=element_text(face="bold",hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5))
+p4 <- ggdraw(p4) + draw_plot(pie_plot, x = x.positions["Sexual","down-regulated"],
+                             y = y.positions["Sexual","down-regulated"],
+                             width=sizes["Sexual","down-regulated"],
+                             height=sizes["Sexual","down-regulated"])
+ragg::agg_png("/storage/RNASeq2025/08_deseq2/go_t3.png", height=2000, width=3000,res=300, scaling=0.5)
+((p1 / p2) | (p3 / p4))+plot_annotation(title="Enriched Gene Ontology terms at T3 vs. T0",
+                                        theme=theme(plot.title = element_text(size = 16, face = "bold")))
+dev.off()
+```
+
